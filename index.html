@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Grindbot</title>
+<style>
+  :root {
+    --bg: #f5f5f5;
+    --text: #333;
+    --card-bg: #fff;
+    --card-shadow: rgba(0,0,0,0.1);
+    --card-hover: #fafafa;
+    --border: #ddd;
+    --border-light: #eee;
+    --muted: #555;
+    --muted2: #666;
+    --muted3: #999;
+    --input-bg: #fff;
+    --output-bg: #f9fafb;
+    --output-border: #e5e7eb;
+    --history-claude-bg: #f0f9ff;
+    --history-user-bg: #f0fdf4;
+    --question-bg: #fef3c7;
+    --question-border: #fcd34d;
+    --spinner-bg: #dbeafe;
+  }
+
+  body.dark {
+    --bg: #1a1a2e;
+    --text: #e0e0e0;
+    --card-bg: #16213e;
+    --card-shadow: rgba(0,0,0,0.3);
+    --card-hover: #1a2744;
+    --border: #2a3a5c;
+    --border-light: #223052;
+    --muted: #a0a0b8;
+    --muted2: #8888a0;
+    --muted3: #606078;
+    --input-bg: #1e2d4a;
+    --output-bg: #121a2e;
+    --output-border: #2a3a5c;
+    --history-claude-bg: #152040;
+    --history-user-bg: #0f2818;
+    --question-bg: #3a2e10;
+    --question-border: #6b5c1e;
+    --spinner-bg: #1e3050;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); max-width: 900px; margin: 0 auto; padding: 20px; transition: background 0.2s, color 0.2s; }
+
+  header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding: 16px 20px; background: var(--card-bg); border-radius: 8px; box-shadow: 0 1px 3px var(--card-shadow); }
+  header h1 { font-size: 24px; }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .polling-controls { display: flex; align-items: center; gap: 10px; }
+  .polling-controls select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); }
+  .polling-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .polling-indicator.on { background: #22c55e; }
+  .polling-indicator.off { background: #ef4444; }
+
+  .theme-toggle { background: none; border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 16px; line-height: 1; color: var(--text); }
+  .theme-toggle:hover { background: var(--card-hover); }
+
+  button { padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; }
+  .btn-primary { background: #3b82f6; color: #fff; }
+  .btn-primary:hover { background: #2563eb; }
+  .btn-success { background: #22c55e; color: #fff; }
+  .btn-success:hover { background: #16a34a; }
+  .btn-danger { background: #ef4444; color: #fff; }
+  .btn-danger:hover { background: #dc2626; }
+  .btn-warning { background: #f59e0b; color: #fff; }
+  .btn-warning:hover { background: #d97706; }
+  .btn-secondary { background: #6b7280; color: #fff; }
+  .btn-secondary:hover { background: #4b5563; }
+
+  .add-form { background: var(--card-bg); padding: 16px 20px; border-radius: 8px; box-shadow: 0 1px 3px var(--card-shadow); margin-bottom: 24px; }
+  .add-form h2 { font-size: 16px; margin-bottom: 12px; }
+  .add-form input, .add-form textarea { width: 100%; padding: 8px 12px; border: 1px solid var(--border); border-radius: 4px; font-size: 14px; margin-bottom: 10px; font-family: inherit; background: var(--input-bg); color: var(--text); }
+  .add-form textarea { height: 80px; resize: vertical; }
+
+  .task-card { background: var(--card-bg); border-radius: 8px; box-shadow: 0 1px 3px var(--card-shadow); margin-bottom: 12px; overflow: hidden; }
+  .task-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; cursor: pointer; }
+  .task-header:hover { background: var(--card-hover); }
+  .task-title { font-weight: 600; flex: 1; }
+  .task-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; text-transform: uppercase; margin-left: 12px; }
+  .badge-pending { background: #fef3c7; color: #92400e; }
+  .badge-running { background: #dbeafe; color: #1e40af; }
+  .badge-review { background: #ede9fe; color: #5b21b6; }
+  .badge-question { background: #fce7f3; color: #9d174d; }
+  .badge-completed { background: #dcfce7; color: #166534; }
+
+  .task-body { padding: 0 20px 16px; border-top: 1px solid var(--border-light); display: none; }
+  .task-body.open { display: block; padding-top: 16px; }
+  .task-desc { color: var(--muted); margin-bottom: 12px; white-space: pre-wrap; }
+  .task-output { background: var(--output-bg); border: 1px solid var(--output-border); border-radius: 4px; padding: 12px; margin-bottom: 12px; max-height: 400px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; font-size: 13px; }
+  .task-question { background: var(--question-bg); border: 1px solid var(--question-border); border-radius: 4px; padding: 12px; margin-bottom: 12px; }
+
+  .task-actions { display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; }
+  .task-actions textarea { flex: 1; min-width: 200px; padding: 8px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; font-family: inherit; height: 60px; resize: vertical; background: var(--input-bg); color: var(--text); }
+
+  .history-section { margin-bottom: 12px; }
+  .history-section h4 { font-size: 13px; color: var(--muted2); margin-bottom: 8px; }
+  .history-entry { padding: 8px 12px; margin-bottom: 6px; border-radius: 4px; font-size: 13px; white-space: pre-wrap; }
+  .history-entry.claude { background: var(--history-claude-bg); border-left: 3px solid #3b82f6; }
+  .history-entry.user { background: var(--history-user-bg); border-left: 3px solid #22c55e; }
+  .history-role { font-weight: 600; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; color: var(--muted2); }
+
+  .delete-btn { background: none; border: none; color: var(--muted3); cursor: pointer; font-size: 18px; padding: 4px 8px; margin-left: 8px; }
+  .delete-btn:hover { color: #ef4444; }
+
+  .config-section { margin-top: 24px; padding: 16px 20px; background: var(--card-bg); border-radius: 8px; box-shadow: 0 1px 3px var(--card-shadow); }
+  .config-section h3 { font-size: 14px; margin-bottom: 10px; }
+  .config-row { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .config-row label { font-size: 13px; color: var(--muted); min-width: 130px; }
+  .config-row input { padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; flex: 1; background: var(--input-bg); color: var(--text); }
+
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--spinner-bg); border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin-left: 6px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="header-left">
+    <h1>Grindbot</h1>
+    <button class="theme-toggle" id="themeBtn" onclick="toggleTheme()" title="Toggle dark mode">&#9790;</button>
+  </div>
+  <div class="polling-controls">
+    <span class="polling-indicator off" id="pollingDot"></span>
+    <span id="pollingLabel">Polling off</span>
+    <select id="intervalSelect">
+      <option value="10">10s</option>
+      <option value="30" selected>30s</option>
+      <option value="60">60s</option>
+      <option value="120">120s</option>
+    </select>
+    <button class="btn-primary" id="pollingBtn" onclick="togglePolling()">Start</button>
+  </div>
+</header>
+
+<div class="add-form">
+  <h2>New Task</h2>
+  <input type="text" id="taskTitle" placeholder="Task title">
+  <textarea id="taskDesc" placeholder="Task description (what should Claude do?)"></textarea>
+  <button class="btn-primary" onclick="addTask()">Add Task</button>
+</div>
+
+<div id="taskList"></div>
+
+<div class="config-section">
+  <h3>Settings</h3>
+  <div class="config-row">
+    <label>Working Directory</label>
+    <input type="text" id="workDirInput" value=".">
+    <button class="btn-secondary" onclick="saveConfig()">Save</button>
+  </div>
+</div>
+
+<script>
+  let tasks = [];
+  let pollingOn = false;
+  let expandedTasks = new Set();
+
+  async function api(method, path, body) {
+    const opts = { method, headers: { 'Content-Type': 'application/json' } };
+    if (body) opts.body = JSON.stringify(body);
+    const res = await fetch(path, opts);
+    return res.json();
+  }
+
+  async function refresh() {
+    tasks = await api('GET', '/api/tasks');
+    renderTasks();
+    const status = await api('GET', '/api/polling/status');
+    pollingOn = status.polling;
+    updatePollingUI();
+  }
+
+  function updatePollingUI() {
+    const dot = document.getElementById('pollingDot');
+    const label = document.getElementById('pollingLabel');
+    const btn = document.getElementById('pollingBtn');
+    dot.className = 'polling-indicator ' + (pollingOn ? 'on' : 'off');
+    label.textContent = pollingOn ? 'Polling on' : 'Polling off';
+    btn.textContent = pollingOn ? 'Stop' : 'Start';
+    btn.className = pollingOn ? 'btn-danger' : 'btn-primary';
+  }
+
+  async function togglePolling() {
+    // Update interval first
+    const interval = document.getElementById('intervalSelect').value;
+    await api('PATCH', '/api/config', { pollingInterval: Number(interval) });
+
+    if (pollingOn) {
+      await api('POST', '/api/polling/stop');
+    } else {
+      await api('POST', '/api/polling/start');
+    }
+    pollingOn = !pollingOn;
+    updatePollingUI();
+  }
+
+  async function addTask() {
+    const title = document.getElementById('taskTitle').value.trim();
+    const description = document.getElementById('taskDesc').value.trim();
+    if (!title) return alert('Title is required');
+    await api('POST', '/api/tasks', { title, description });
+    document.getElementById('taskTitle').value = '';
+    document.getElementById('taskDesc').value = '';
+    refresh();
+  }
+
+  async function deleteTask(id, e) {
+    e.stopPropagation();
+    if (!confirm('Delete this task?')) return;
+    await api('DELETE', '/api/tasks/' + id);
+    refresh();
+  }
+
+  async function approveTask(id) {
+    await api('PATCH', '/api/tasks/' + id, { status: 'completed' });
+    refresh();
+  }
+
+  async function rejectTask(id) {
+    const textarea = document.getElementById('feedback-' + id);
+    const feedback = textarea ? textarea.value.trim() : '';
+    if (!feedback) return alert('Please provide feedback for rejection');
+    await api('PATCH', '/api/tasks/' + id, { status: 'pending', feedback });
+    refresh();
+  }
+
+  async function answerQuestion(id) {
+    const textarea = document.getElementById('feedback-' + id);
+    const feedback = textarea ? textarea.value.trim() : '';
+    if (!feedback) return alert('Please provide an answer');
+    await api('PATCH', '/api/tasks/' + id, { status: 'pending', feedback });
+    refresh();
+  }
+
+  function toggleExpand(id) {
+    if (expandedTasks.has(id)) {
+      expandedTasks.delete(id);
+    } else {
+      expandedTasks.add(id);
+    }
+    renderTasks();
+  }
+
+  function escapeHtml(str) {
+    if (!str) return '';
+    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function truncate(str, len) {
+    if (!str || str.length <= len) return str;
+    return str.slice(0, len) + '...';
+  }
+
+  function renderTasks() {
+    const container = document.getElementById('taskList');
+    if (!tasks.length) {
+      container.innerHTML = '<p style="color:#999;text-align:center;padding:40px;">No tasks yet. Add one above.</p>';
+      return;
+    }
+
+    container.innerHTML = tasks.map(t => {
+      const expanded = expandedTasks.has(t.id);
+      const badgeClass = 'badge-' + t.status;
+
+      let bodyHtml = '';
+      if (expanded) {
+        bodyHtml += `<div class="task-desc">${escapeHtml(t.description)}</div>`;
+
+        // History
+        if (t.history && t.history.length > 0) {
+          bodyHtml += '<div class="history-section"><h4>History</h4>';
+          for (const entry of t.history) {
+            const roleClass = entry.role === 'claude' ? 'claude' : 'user';
+            const roleLabel = entry.role === 'claude' ? 'Claude' : 'You';
+            bodyHtml += `<div class="history-entry ${roleClass}"><div class="history-role">${roleLabel}</div>${escapeHtml(truncate(entry.content, 3000))}</div>`;
+          }
+          bodyHtml += '</div>';
+        }
+
+        // Current output (if different from last history)
+        if (t.output && t.status !== 'completed') {
+          bodyHtml += `<div class="task-output">${escapeHtml(truncate(t.output, 5000))}</div>`;
+        }
+
+        // Question display
+        if (t.status === 'question' && t.question) {
+          bodyHtml += `<div class="task-question"><strong>Question:</strong> ${escapeHtml(t.question)}</div>`;
+        }
+
+        // Action buttons
+        if (t.status === 'review') {
+          bodyHtml += `<div class="task-actions">
+            <textarea id="feedback-${t.id}" placeholder="Feedback (required for rejection)"></textarea>
+            <div style="display:flex;flex-direction:column;gap:6px;">
+              <button class="btn-success" onclick="approveTask('${t.id}')">Approve</button>
+              <button class="btn-warning" onclick="rejectTask('${t.id}')">Reject</button>
+            </div>
+          </div>`;
+        } else if (t.status === 'question') {
+          bodyHtml += `<div class="task-actions">
+            <textarea id="feedback-${t.id}" placeholder="Your answer..."></textarea>
+            <button class="btn-primary" onclick="answerQuestion('${t.id}')">Answer</button>
+          </div>`;
+        }
+      }
+
+      const runningIndicator = t.status === 'running' ? '<span class="spinner"></span>' : '';
+
+      return `<div class="task-card">
+        <div class="task-header" onclick="toggleExpand('${t.id}')">
+          <span class="task-title">${escapeHtml(t.title)} ${runningIndicator}</span>
+          <span class="task-badge ${badgeClass}">${t.status}</span>
+          <button class="delete-btn" onclick="deleteTask('${t.id}', event)" title="Delete">&times;</button>
+        </div>
+        <div class="task-body ${expanded ? 'open' : ''}">${bodyHtml}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // Load config
+  async function loadConfig() {
+    const config = await api('GET', '/api/config');
+    document.getElementById('workDirInput').value = config.workingDirectory || '.';
+    document.getElementById('intervalSelect').value = String(config.pollingInterval || 30);
+  }
+
+  async function saveConfig() {
+    const workDir = document.getElementById('workDirInput').value.trim();
+    await api('PATCH', '/api/config', { workingDirectory: workDir });
+    alert('Config saved');
+  }
+
+  // Theme
+  function toggleTheme() {
+    const isDark = document.body.classList.toggle('dark');
+    localStorage.setItem('grindbot-theme', isDark ? 'dark' : 'light');
+    document.getElementById('themeBtn').innerHTML = isDark ? '&#9788;' : '&#9790;';
+  }
+
+  (function initTheme() {
+    const saved = localStorage.getItem('grindbot-theme');
+    const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    if (saved === 'dark' || (!saved && prefersDark)) {
+      document.body.classList.add('dark');
+      document.getElementById('themeBtn').innerHTML = '&#9788;';
+    }
+  })();
+
+  // Init
+  loadConfig();
+  refresh();
+  setInterval(refresh, 2000);
+</script>
+</body>
+</html>
