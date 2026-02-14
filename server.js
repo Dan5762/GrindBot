@@ -1,7 +1,8 @@
 const express = require('express');
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -10,33 +11,61 @@ app.use(express.json());
 const TASKS_FILE = path.join(__dirname, 'tasks.json');
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
+// --- SSE client tracking ---
+
+const sseClients = new Set();
+
+function broadcast() {
+  const data = JSON.stringify(loadTasks());
+  for (const res of sseClients) {
+    try {
+      res.write(`data: ${data}\n\n`);
+    } catch {
+      sseClients.delete(res);
+    }
+  }
+}
+
 // --- File-based persistence ---
 
 function loadTasks() {
   if (!fs.existsSync(TASKS_FILE)) return [];
-  return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8'));
+  try { return JSON.parse(fs.readFileSync(TASKS_FILE, 'utf8')); }
+  catch { return []; }
 }
 
 function saveTasks(tasks) {
   fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2));
+  broadcast();
 }
 
 function loadConfig() {
+  const defaults = { pollingInterval: 30, workingDirectory: '.' };
   if (!fs.existsSync(CONFIG_FILE)) {
-    const defaults = { pollingInterval: 30, workingDirectory: '.' };
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(defaults, null, 2));
     return defaults;
   }
-  return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); }
+  catch { return defaults; }
 }
 
 function saveConfig(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
+// --- tmux detection ---
+
+let hasTmux = false;
+try {
+  execSync('which tmux', { stdio: 'ignore' });
+  hasTmux = true;
+} catch {
+  console.warn('WARNING: tmux not found. Falling back to non-interactive mode. Install with: brew install tmux');
+}
+
 // --- Process tracking ---
 
-const runningProcesses = new Map(); // taskId -> { process, stdout, stderr }
+const runningProcesses = new Map(); // taskId -> { process } or tmux session name
 
 // --- Polling engine ---
 
@@ -59,6 +88,55 @@ function stopPolling() {
   }
 }
 
+function tmuxSessionExists(sessionName) {
+  try {
+    execSync(`tmux has-session -t ${sessionName}`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stripAnsi(str) {
+  // eslint-disable-next-line no-control-regex
+  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+}
+
+function finishTmuxTask(task, tasks) {
+  const logFile = path.join(os.tmpdir(), `grindbot-${task.id}.log`);
+  const promptFile = path.join(os.tmpdir(), `grindbot-${task.id}.prompt`);
+
+  let output = '(no output)';
+  try {
+    output = fs.readFileSync(logFile, 'utf8');
+    output = stripAnsi(output);
+  } catch {}
+
+  output = output.length > 50000 ? output.slice(-50000) : output;
+  task.output = output;
+
+  const questionMatch = output.match(/^\[QUESTION\]:\s*(.+)$/m);
+  if (questionMatch) {
+    task.status = 'question';
+    task.question = questionMatch[1].trim();
+  } else {
+    task.status = 'review';
+    task.question = null;
+  }
+
+  task.history = task.history || [];
+  task.history.push({ role: 'claude', content: output });
+  task.pid = null;
+  task.feedback = null;
+  task.updatedAt = new Date().toISOString();
+
+  runningProcesses.delete(task.id);
+
+  // Clean up temp files
+  try { fs.unlinkSync(logFile); } catch {}
+  try { fs.unlinkSync(promptFile); } catch {}
+}
+
 function pollTick() {
   const tasks = loadTasks();
   let changed = false;
@@ -68,15 +146,29 @@ function pollTick() {
       spawnClaude(task);
       changed = true;
     } else if (task.status === 'running') {
-      const proc = runningProcesses.get(task.id);
-      if (!proc) {
-        // Process not tracked (server restarted?) — reset to pending
+      if (hasTmux && runningProcesses.has(task.id) && runningProcesses.get(task.id).tmux) {
+        // tmux mode: check if session still exists
+        const sessionName = `grindbot-${task.id}`;
+        if (!tmuxSessionExists(sessionName)) {
+          finishTmuxTask(task, tasks);
+          changed = true;
+        }
+      } else if (!hasTmux) {
+        // Non-tmux mode: process completion handled by spawn callback
+        const proc = runningProcesses.get(task.id);
+        if (!proc) {
+          task.status = 'pending';
+          task.pid = null;
+          task.updatedAt = new Date().toISOString();
+          changed = true;
+        }
+      } else if (!runningProcesses.has(task.id)) {
+        // Server restarted — reset to pending
         task.status = 'pending';
         task.pid = null;
         task.updatedAt = new Date().toISOString();
         changed = true;
       }
-      // If process is tracked but still running, skip — completion handled in spawn callback
     }
   }
 
@@ -104,7 +196,48 @@ function buildPrompt(task) {
   return prompt;
 }
 
-function spawnClaude(task) {
+function spawnClaudeTmux(task) {
+  const config = loadConfig();
+  const workDir = path.resolve(config.workingDirectory);
+  const prompt = buildPrompt(task);
+  const sessionName = `grindbot-${task.id}`;
+  const promptFile = path.join(os.tmpdir(), `grindbot-${task.id}.prompt`);
+  const logFile = path.join(os.tmpdir(), `grindbot-${task.id}.log`);
+
+  // Write prompt to temp file
+  fs.writeFileSync(promptFile, prompt);
+
+  // Ensure no stale log file
+  try { fs.unlinkSync(logFile); } catch {}
+
+  try {
+    // Start tmux session with claude in interactive mode
+    execSync(
+      `tmux new-session -d -s ${sessionName} -c ${JSON.stringify(workDir)} -- claude --dangerously-skip-permissions "$(cat ${JSON.stringify(promptFile)})"`,
+      { stdio: 'ignore' }
+    );
+
+    // Pipe output to log file (output only)
+    execSync(
+      `tmux pipe-pane -o -t ${sessionName} 'cat >> ${JSON.stringify(logFile)}'`,
+      { stdio: 'ignore' }
+    );
+
+    runningProcesses.set(task.id, { tmux: true, sessionName });
+    task.status = 'running';
+    task.pid = null;
+    task.updatedAt = new Date().toISOString();
+  } catch (err) {
+    task.status = 'review';
+    task.output = `Error starting tmux session: ${err.message}`;
+    task.history = task.history || [];
+    task.history.push({ role: 'claude', content: task.output });
+    task.updatedAt = new Date().toISOString();
+    try { fs.unlinkSync(promptFile); } catch {}
+  }
+}
+
+function spawnClaudeLegacy(task) {
   const config = loadConfig();
   const workDir = path.resolve(config.workingDirectory);
   const prompt = buildPrompt(task);
@@ -127,10 +260,9 @@ function spawnClaude(task) {
     const t = tasks.find(x => x.id === task.id);
     if (!t) return;
 
-    const output = stdout || stderr || '(no output)';
+    const output = stdout || stderr || (code !== 0 ? `(process exited with code ${code})` : '(no output)');
     t.output = output.length > 50000 ? output.slice(-50000) : output;
 
-    // Check for question marker
     const questionMatch = output.match(/^\[QUESTION\]:\s*(.+)$/m);
     if (questionMatch) {
       t.status = 'question';
@@ -162,12 +294,18 @@ function spawnClaude(task) {
     saveTasks(tasks);
   });
 
-  runningProcesses.set(task.id, { process: proc, stdout: '', stderr: '' });
-
-  // Update task in-place
+  runningProcesses.set(task.id, { process: proc });
   task.status = 'running';
   task.pid = proc.pid;
   task.updatedAt = new Date().toISOString();
+}
+
+function spawnClaude(task) {
+  if (hasTmux) {
+    spawnClaudeTmux(task);
+  } else {
+    spawnClaudeLegacy(task);
+  }
 }
 
 // --- REST API ---
@@ -175,6 +313,19 @@ function spawnClaude(task) {
 // Serve index.html
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'index.html'));
+});
+
+// SSE endpoint
+app.get('/api/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  // Send current state immediately on connect
+  res.write(`data: ${JSON.stringify(loadTasks())}\n\n`);
+  sseClients.add(res);
+  req.on('close', () => sseClients.delete(res));
 });
 
 // Tasks CRUD
@@ -253,10 +404,17 @@ app.delete('/api/tasks/:id', (req, res) => {
   const idx = tasks.findIndex(t => t.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'task not found' });
 
-  // Kill running process if any
-  const proc = runningProcesses.get(req.params.id);
-  if (proc) {
-    proc.process.kill();
+  // Kill running process/session
+  const entry = runningProcesses.get(req.params.id);
+  if (entry) {
+    if (entry.tmux) {
+      try { execSync(`tmux kill-session -t grindbot-${req.params.id}`, { stdio: 'ignore' }); } catch {}
+      // Clean up temp files
+      try { fs.unlinkSync(path.join(os.tmpdir(), `grindbot-${req.params.id}.log`)); } catch {}
+      try { fs.unlinkSync(path.join(os.tmpdir(), `grindbot-${req.params.id}.prompt`)); } catch {}
+    } else if (entry.process) {
+      entry.process.kill();
+    }
     runningProcesses.delete(req.params.id);
   }
 
@@ -265,9 +423,36 @@ app.delete('/api/tasks/:id', (req, res) => {
   res.json({ ok: true });
 });
 
+// Open terminal for running task
+app.post('/api/tasks/:id/terminal', (req, res) => {
+  if (!hasTmux) {
+    return res.status(400).json({ error: 'tmux is not available' });
+  }
+
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.id === req.params.id);
+  if (!task) return res.status(404).json({ error: 'task not found' });
+  if (task.status !== 'running') return res.status(400).json({ error: 'task is not running' });
+
+  const sessionName = `grindbot-${task.id}`;
+  if (!tmuxSessionExists(sessionName)) {
+    return res.status(400).json({ error: 'tmux session not found' });
+  }
+
+  try {
+    execSync(
+      `osascript -e 'tell app "Terminal" to do script "tmux attach -t ${sessionName}"'`,
+      { stdio: 'ignore' }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to open terminal: ' + err.message });
+  }
+});
+
 // Config
 app.get('/api/config', (req, res) => {
-  res.json(loadConfig());
+  res.json({ ...loadConfig(), hasTmux });
 });
 
 app.patch('/api/config', (req, res) => {
@@ -303,7 +488,26 @@ app.get('/api/polling/status', (req, res) => {
 
 // --- Start server ---
 
+// --- Graceful shutdown ---
+
+function shutdown() {
+  for (const [id, entry] of runningProcesses) {
+    if (entry.tmux) {
+      try { execSync(`tmux kill-session -t grindbot-${id}`, { stdio: 'ignore' }); } catch {}
+    } else if (entry.process) {
+      entry.process.kill();
+    }
+  }
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
+// --- Start server ---
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Grindbot running at http://localhost:${PORT}`);
+  console.log(`tmux: ${hasTmux ? 'available (interactive mode)' : 'not found (non-interactive fallback)'}`);
+  startPolling();
 });

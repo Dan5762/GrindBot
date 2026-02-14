@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Grindbot</title>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
   :root {
     --bg: #f5f5f5;
@@ -53,12 +54,6 @@
   header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; padding: 16px 20px; background: var(--card-bg); border-radius: 8px; box-shadow: 0 1px 3px var(--card-shadow); }
   header h1 { font-size: 24px; }
   .header-left { display: flex; align-items: center; gap: 12px; }
-  .polling-controls { display: flex; align-items: center; gap: 10px; }
-  .polling-controls select { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--input-bg); color: var(--text); }
-  .polling-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
-  .polling-indicator.on { background: #22c55e; }
-  .polling-indicator.off { background: #ef4444; }
-
   .theme-toggle { background: none; border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; cursor: pointer; font-size: 16px; line-height: 1; color: var(--text); }
   .theme-toggle:hover { background: var(--card-hover); }
 
@@ -105,6 +100,14 @@
   .history-entry.claude { background: var(--history-claude-bg); border-left: 3px solid #3b82f6; }
   .history-entry.user { background: var(--history-user-bg); border-left: 3px solid #22c55e; }
   .history-role { font-weight: 600; font-size: 11px; text-transform: uppercase; margin-bottom: 4px; color: var(--muted2); }
+  .history-entry .md-content { font-size: 13px; line-height: 1.5; }
+  .history-entry .md-content p { margin: 0.4em 0; }
+  .history-entry .md-content pre { background: var(--output-bg); border: 1px solid var(--output-border); border-radius: 4px; padding: 8px 10px; overflow-x: auto; margin: 0.5em 0; }
+  .history-entry .md-content code { font-family: monospace; font-size: 12px; }
+  .history-entry .md-content :not(pre) > code { background: var(--output-bg); padding: 1px 4px; border-radius: 3px; }
+  .history-entry .md-content ul, .history-entry .md-content ol { margin: 0.4em 0; padding-left: 1.5em; }
+  .history-entry .md-content h1, .history-entry .md-content h2, .history-entry .md-content h3 { margin: 0.6em 0 0.3em; font-size: 14px; }
+  .history-entry .md-content blockquote { border-left: 3px solid var(--border); padding-left: 10px; margin: 0.4em 0; color: var(--muted); }
 
   .delete-btn { background: none; border: none; color: var(--muted3); cursor: pointer; font-size: 18px; padding: 4px 8px; margin-left: 8px; }
   .delete-btn:hover { color: #ef4444; }
@@ -125,17 +128,6 @@
   <div class="header-left">
     <h1>Grindbot</h1>
     <button class="theme-toggle" id="themeBtn" onclick="toggleTheme()" title="Toggle dark mode">&#9790;</button>
-  </div>
-  <div class="polling-controls">
-    <span class="polling-indicator off" id="pollingDot"></span>
-    <span id="pollingLabel">Polling off</span>
-    <select id="intervalSelect">
-      <option value="10">10s</option>
-      <option value="30" selected>30s</option>
-      <option value="60">60s</option>
-      <option value="120">120s</option>
-    </select>
-    <button class="btn-primary" id="pollingBtn" onclick="togglePolling()">Start</button>
   </div>
 </header>
 
@@ -159,8 +151,8 @@
 
 <script>
   let tasks = [];
-  let pollingOn = false;
   let expandedTasks = new Set();
+  let serverHasTmux = false;
 
   async function api(method, path, body) {
     const opts = { method, headers: { 'Content-Type': 'application/json' } };
@@ -172,33 +164,6 @@
   async function refresh() {
     tasks = await api('GET', '/api/tasks');
     renderTasks();
-    const status = await api('GET', '/api/polling/status');
-    pollingOn = status.polling;
-    updatePollingUI();
-  }
-
-  function updatePollingUI() {
-    const dot = document.getElementById('pollingDot');
-    const label = document.getElementById('pollingLabel');
-    const btn = document.getElementById('pollingBtn');
-    dot.className = 'polling-indicator ' + (pollingOn ? 'on' : 'off');
-    label.textContent = pollingOn ? 'Polling on' : 'Polling off';
-    btn.textContent = pollingOn ? 'Stop' : 'Start';
-    btn.className = pollingOn ? 'btn-danger' : 'btn-primary';
-  }
-
-  async function togglePolling() {
-    // Update interval first
-    const interval = document.getElementById('intervalSelect').value;
-    await api('PATCH', '/api/config', { pollingInterval: Number(interval) });
-
-    if (pollingOn) {
-      await api('POST', '/api/polling/stop');
-    } else {
-      await api('POST', '/api/polling/start');
-    }
-    pollingOn = !pollingOn;
-    updatePollingUI();
   }
 
   async function addTask() {
@@ -231,6 +196,16 @@
     refresh();
   }
 
+  async function openTerminal(id, e) {
+    e.stopPropagation();
+    try {
+      const result = await api('POST', '/api/tasks/' + id + '/terminal');
+      if (result.error) alert(result.error);
+    } catch (err) {
+      alert('Failed to open terminal');
+    }
+  }
+
   async function answerQuestion(id) {
     const textarea = document.getElementById('feedback-' + id);
     const feedback = textarea ? textarea.value.trim() : '';
@@ -258,6 +233,11 @@
     return str.slice(0, len) + '...';
   }
 
+  function renderMarkdown(text) {
+    if (!text) return '';
+    return marked.parse(truncate(text, 5000));
+  }
+
   function renderTasks() {
     const container = document.getElementById('taskList');
     if (!tasks.length) {
@@ -279,14 +259,12 @@
           for (const entry of t.history) {
             const roleClass = entry.role === 'claude' ? 'claude' : 'user';
             const roleLabel = entry.role === 'claude' ? 'Claude' : 'You';
-            bodyHtml += `<div class="history-entry ${roleClass}"><div class="history-role">${roleLabel}</div>${escapeHtml(truncate(entry.content, 3000))}</div>`;
+            const content = entry.role === 'claude'
+              ? `<div class="md-content">${renderMarkdown(entry.content)}</div>`
+              : escapeHtml(entry.content);
+            bodyHtml += `<div class="history-entry ${roleClass}"><div class="history-role">${roleLabel}</div>${content}</div>`;
           }
           bodyHtml += '</div>';
-        }
-
-        // Current output (if different from last history)
-        if (t.output && t.status !== 'completed') {
-          bodyHtml += `<div class="task-output">${escapeHtml(truncate(t.output, 5000))}</div>`;
         }
 
         // Question display
@@ -311,7 +289,10 @@
         }
       }
 
-      const runningIndicator = t.status === 'running' ? '<span class="spinner"></span>' : '';
+      const openBtn = (t.status === 'running' && serverHasTmux)
+        ? `<button class="btn-secondary" style="padding:3px 10px;font-size:12px;margin-left:8px;" onclick="openTerminal('${t.id}', event)">Open</button>`
+        : '';
+      const runningIndicator = t.status === 'running' ? '<span class="spinner"></span>' + openBtn : '';
 
       return `<div class="task-card">
         <div class="task-header" onclick="toggleExpand('${t.id}')">
@@ -328,7 +309,7 @@
   async function loadConfig() {
     const config = await api('GET', '/api/config');
     document.getElementById('workDirInput').value = config.workingDirectory || '.';
-    document.getElementById('intervalSelect').value = String(config.pollingInterval || 30);
+    serverHasTmux = !!config.hasTmux;
   }
 
   async function saveConfig() {
@@ -353,10 +334,24 @@
     }
   })();
 
+  // SSE connection for real-time updates
+  function connectSSE() {
+    const es = new EventSource('/api/events');
+    es.onmessage = (event) => {
+      tasks = JSON.parse(event.data);
+      const active = document.activeElement;
+      if (active && active.tagName === 'TEXTAREA' && active.id && active.id.startsWith('feedback-')) return;
+      renderTasks();
+    };
+    es.onerror = () => {
+      // EventSource reconnects automatically; no action needed
+    };
+  }
+
   // Init
   loadConfig();
   refresh();
-  setInterval(refresh, 2000);
+  connectSSE();
 </script>
 </body>
 </html>
