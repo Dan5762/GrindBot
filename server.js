@@ -65,7 +65,7 @@ try {
 
 // --- Process tracking ---
 
-const runningProcesses = new Map(); // taskId -> { process } or tmux session name
+const runningProcesses = new Map(); // taskId -> TmuxSession or ChildProcess
 
 // --- Polling engine ---
 
@@ -88,53 +88,125 @@ function stopPolling() {
   }
 }
 
-function tmuxSessionExists(sessionName) {
-  try {
-    execSync(`tmux has-session -t ${sessionName}`, { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function stripAnsi(str) {
   // eslint-disable-next-line no-control-regex
-  return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+  return str
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z<>=~]/g, '')  // CSI sequences (incl. ?-prefixed private modes)
+    .replace(/\x1b\][^\x07]*\x07/g, '')            // OSC sequences
+    .replace(/\x1b[()][0-9A-Z]/g, '')              // Character set selection
+    .replace(/\r/g, '');                            // Carriage returns
 }
 
-function finishTmuxTask(task, tasks) {
-  const logFile = path.join(os.tmpdir(), `grindbot-${task.id}.log`);
-  const promptFile = path.join(os.tmpdir(), `grindbot-${task.id}.prompt`);
+// Shared completion logic — both tmux and legacy paths call this
+function finishTask(taskId, rawOutput) {
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.id === taskId);
+  if (!task || task.status !== 'running') return;
 
-  let output = '(no output)';
-  try {
-    output = fs.readFileSync(logFile, 'utf8');
-    output = stripAnsi(output);
-  } catch {}
-
+  let output = rawOutput || '(no output)';
+  output = stripAnsi(output);
   output = output.length > 50000 ? output.slice(-50000) : output;
   task.output = output;
 
-  const questionMatch = output.match(/^\[QUESTION\]:\s*(.+)$/m);
-  if (questionMatch) {
-    task.status = 'question';
-    task.question = questionMatch[1].trim();
-  } else {
-    task.status = 'review';
-    task.question = null;
-  }
-
-  task.history = task.history || [];
-  task.history.push({ role: 'claude', content: output });
+  task.status = 'completed';
   task.pid = null;
-  task.feedback = null;
   task.updatedAt = new Date().toISOString();
 
-  runningProcesses.delete(task.id);
+  saveTasks(tasks);
+}
 
-  // Clean up temp files
-  try { fs.unlinkSync(logFile); } catch {}
-  try { fs.unlinkSync(promptFile); } catch {}
+// --- TmuxSession: manages one claude instance in a tmux session ---
+//
+// Claude runs with -p (pipe mode) so it processes the prompt and exits.
+// Detection: poll `tmux has-session` every 3 seconds. When claude exits,
+// the session is destroyed and the poll detects it.
+//
+// The launcher uses `exec` so claude replaces the shell — when it exits,
+// the session dies immediately. CLAUDECODE is unset so claude doesn't
+// refuse to start if the server was launched from inside Claude Code.
+
+class TmuxSession {
+  constructor(taskId) {
+    this.taskId = taskId;
+    this.sessionName = `grindbot-${taskId}`;
+    this.promptFile = path.join(os.tmpdir(), `grindbot-${taskId}.prompt`);
+    this.logFile = path.join(os.tmpdir(), `grindbot-${taskId}.log`);
+    this.launcherFile = path.join(os.tmpdir(), `grindbot-${taskId}.sh`);
+    this._pollTimer = null;
+  }
+
+  start(prompt, workDir) {
+    fs.writeFileSync(this.promptFile, prompt);
+    try { fs.unlinkSync(this.logFile); } catch {}
+
+    fs.writeFileSync(this.launcherFile, [
+      '#!/bin/bash',
+      'unset CLAUDECODE',
+      `exec claude -p --dangerously-skip-permissions "$(cat '${this.promptFile}')"`,
+    ].join('\n'));
+    fs.chmodSync(this.launcherFile, 0o755);
+
+    execSync(
+      `tmux new-session -d -s ${this.sessionName} -c '${workDir}' '${this.launcherFile}'`,
+      { stdio: 'ignore' }
+    );
+    execSync(
+      `tmux pipe-pane -o -t ${this.sessionName} 'cat >> ${this.logFile}'`,
+      { stdio: 'ignore' }
+    );
+
+    this._startMonitor();
+  }
+
+  // Re-attach monitoring to a session that survived a server restart
+  reattach() {
+    this._startMonitor();
+  }
+
+  _startMonitor() {
+    this._pollTimer = setInterval(() => {
+      if (!this.exists) {
+        this._stopMonitor();
+        finishTask(this.taskId, this._readLog());
+        this._cleanupFiles();
+        runningProcesses.delete(this.taskId);
+      }
+    }, 3000);
+  }
+
+  _stopMonitor() {
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer);
+      this._pollTimer = null;
+    }
+  }
+
+  _readLog() {
+    try { return fs.readFileSync(this.logFile, 'utf8'); }
+    catch { return ''; }
+  }
+
+  get exists() {
+    try {
+      execSync(`tmux has-session -t ${this.sessionName}`, { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  kill() {
+    this._stopMonitor();
+    try { execSync(`tmux kill-session -t ${this.sessionName}`, { stdio: 'ignore' }); } catch {}
+    this._cleanupFiles();
+    runningProcesses.delete(this.taskId);
+  }
+
+  _cleanupFiles() {
+    try { fs.unlinkSync(this.logFile); } catch {}
+    try { fs.unlinkSync(this.promptFile); } catch {}
+    try { fs.unlinkSync(this.launcherFile); } catch {}
+  }
 }
 
 function pollTick() {
@@ -146,28 +218,31 @@ function pollTick() {
       spawnClaude(task);
       changed = true;
     } else if (task.status === 'running') {
-      if (hasTmux && runningProcesses.has(task.id) && runningProcesses.get(task.id).tmux) {
-        // tmux mode: check if session still exists
-        const sessionName = `grindbot-${task.id}`;
-        if (!tmuxSessionExists(sessionName)) {
-          finishTmuxTask(task, tasks);
-          changed = true;
-        }
-      } else if (!hasTmux) {
-        // Non-tmux mode: process completion handled by spawn callback
-        const proc = runningProcesses.get(task.id);
-        if (!proc) {
+      const entry = runningProcesses.get(task.id);
+
+      if (!entry) {
+        // Server restarted — check if the tmux session survived
+        if (hasTmux) {
+          const session = new TmuxSession(task.id);
+          if (session.exists) {
+            // Session is still alive, re-attach monitoring
+            session.reattach();
+            runningProcesses.set(task.id, session);
+          } else {
+            // Session is gone — claude finished while server was down
+            task.status = 'completed';
+            task.output = task.output || '(session ended while server was down)';
+            task.pid = null;
+            task.updatedAt = new Date().toISOString();
+            changed = true;
+          }
+        } else {
+          // Legacy mode: no way to recover, reset to pending
           task.status = 'pending';
           task.pid = null;
           task.updatedAt = new Date().toISOString();
           changed = true;
         }
-      } else if (!runningProcesses.has(task.id)) {
-        // Server restarted — reset to pending
-        task.status = 'pending';
-        task.pid = null;
-        task.updatedAt = new Date().toISOString();
-        changed = true;
       }
     }
   }
@@ -176,135 +251,55 @@ function pollTick() {
 }
 
 function buildPrompt(task) {
-  let prompt = `Task: ${task.title}\n\nDescription: ${task.description}`;
-
-  if (task.history && task.history.length > 0) {
-    prompt += '\n\n--- Previous conversation ---';
-    for (const entry of task.history) {
-      const role = entry.role === 'claude' ? 'Claude' : 'User';
-      prompt += `\n\n${role}: ${entry.content}`;
-    }
-    prompt += '\n\n--- End previous conversation ---';
-  }
-
-  if (task.feedback) {
-    prompt += `\n\nUser feedback on previous attempt: ${task.feedback}`;
-  }
-
-  prompt += '\n\nIMPORTANT: If you need clarification or have a question for the user, start a line with "[QUESTION]:" followed by your question. Otherwise, complete the task.';
-
-  return prompt;
-}
-
-function spawnClaudeTmux(task) {
-  const config = loadConfig();
-  const workDir = path.resolve(config.workingDirectory);
-  const prompt = buildPrompt(task);
-  const sessionName = `grindbot-${task.id}`;
-  const promptFile = path.join(os.tmpdir(), `grindbot-${task.id}.prompt`);
-  const logFile = path.join(os.tmpdir(), `grindbot-${task.id}.log`);
-
-  // Write prompt to temp file
-  fs.writeFileSync(promptFile, prompt);
-
-  // Ensure no stale log file
-  try { fs.unlinkSync(logFile); } catch {}
-
-  try {
-    // Start tmux session with claude in interactive mode
-    execSync(
-      `tmux new-session -d -s ${sessionName} -c ${JSON.stringify(workDir)} -- claude --dangerously-skip-permissions "$(cat ${JSON.stringify(promptFile)})"`,
-      { stdio: 'ignore' }
-    );
-
-    // Pipe output to log file (output only)
-    execSync(
-      `tmux pipe-pane -o -t ${sessionName} 'cat >> ${JSON.stringify(logFile)}'`,
-      { stdio: 'ignore' }
-    );
-
-    runningProcesses.set(task.id, { tmux: true, sessionName });
-    task.status = 'running';
-    task.pid = null;
-    task.updatedAt = new Date().toISOString();
-  } catch (err) {
-    task.status = 'review';
-    task.output = `Error starting tmux session: ${err.message}`;
-    task.history = task.history || [];
-    task.history.push({ role: 'claude', content: task.output });
-    task.updatedAt = new Date().toISOString();
-    try { fs.unlinkSync(promptFile); } catch {}
-  }
-}
-
-function spawnClaudeLegacy(task) {
-  const config = loadConfig();
-  const workDir = path.resolve(config.workingDirectory);
-  const prompt = buildPrompt(task);
-
-  const proc = spawn('claude', ['-p', prompt, '--dangerously-skip-permissions'], {
-    cwd: workDir,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env },
-  });
-
-  let stdout = '';
-  let stderr = '';
-
-  proc.stdout.on('data', (data) => { stdout += data.toString(); });
-  proc.stderr.on('data', (data) => { stderr += data.toString(); });
-
-  proc.on('close', (code) => {
-    runningProcesses.delete(task.id);
-    const tasks = loadTasks();
-    const t = tasks.find(x => x.id === task.id);
-    if (!t) return;
-
-    const output = stdout || stderr || (code !== 0 ? `(process exited with code ${code})` : '(no output)');
-    t.output = output.length > 50000 ? output.slice(-50000) : output;
-
-    const questionMatch = output.match(/^\[QUESTION\]:\s*(.+)$/m);
-    if (questionMatch) {
-      t.status = 'question';
-      t.question = questionMatch[1].trim();
-    } else {
-      t.status = 'review';
-      t.question = null;
-    }
-
-    t.history = t.history || [];
-    t.history.push({ role: 'claude', content: output });
-    t.pid = null;
-    t.feedback = null;
-    t.updatedAt = new Date().toISOString();
-    saveTasks(tasks);
-  });
-
-  proc.on('error', (err) => {
-    runningProcesses.delete(task.id);
-    const tasks = loadTasks();
-    const t = tasks.find(x => x.id === task.id);
-    if (!t) return;
-    t.status = 'review';
-    t.output = `Error spawning claude: ${err.message}`;
-    t.history = t.history || [];
-    t.history.push({ role: 'claude', content: t.output });
-    t.pid = null;
-    t.updatedAt = new Date().toISOString();
-    saveTasks(tasks);
-  });
-
-  runningProcesses.set(task.id, { process: proc });
-  task.status = 'running';
-  task.pid = proc.pid;
-  task.updatedAt = new Date().toISOString();
+  return `Task: ${task.title}\n\nDescription: ${task.description}`;
 }
 
 function spawnClaude(task) {
+  const config = loadConfig();
+  const workDir = path.resolve(config.workingDirectory);
+  const prompt = buildPrompt(task);
+
   if (hasTmux) {
-    spawnClaudeTmux(task);
+    const session = new TmuxSession(task.id);
+    try {
+      session.start(prompt, workDir);
+      runningProcesses.set(task.id, session);
+      task.status = 'running';
+      task.pid = null;
+      task.updatedAt = new Date().toISOString();
+    } catch (err) {
+      session.kill();
+      task.status = 'completed';
+      task.output = `Error starting tmux session: ${err.message}`;
+      task.updatedAt = new Date().toISOString();
+    }
   } else {
-    spawnClaudeLegacy(task);
+    const proc = spawn('claude', ['-p', prompt, '--dangerously-skip-permissions'], {
+      cwd: workDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, CLAUDECODE: undefined },
+    });
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    proc.on('close', (code) => {
+      runningProcesses.delete(task.id);
+      const output = stdout || stderr || (code !== 0 ? `(process exited with code ${code})` : '(no output)');
+      finishTask(task.id, output);
+    });
+
+    proc.on('error', (err) => {
+      runningProcesses.delete(task.id);
+      finishTask(task.id, `Error spawning claude: ${err.message}`);
+    });
+
+    runningProcesses.set(task.id, proc);
+    task.status = 'running';
+    task.pid = proc.pid;
+    task.updatedAt = new Date().toISOString();
   }
 }
 
@@ -344,15 +339,13 @@ app.post('/api/tasks', (req, res) => {
     description: description || '',
     status: 'pending',
     output: null,
-    question: null,
-    feedback: null,
-    history: [],
     pid: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   tasks.push(task);
   saveTasks(tasks);
+  process.nextTick(pollTick);
   res.status(201).json(task);
 });
 
@@ -361,36 +354,7 @@ app.patch('/api/tasks/:id', (req, res) => {
   const task = tasks.find(t => t.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'task not found' });
 
-  const { status, feedback, title, description } = req.body;
-
-  // Handle state transitions with validation
-  if (status) {
-    const validTransitions = {
-      'review': ['completed', 'pending'],
-      'question': ['pending'],
-      'pending': ['pending'],
-    };
-
-    const allowed = validTransitions[task.status];
-    if (!allowed || !allowed.includes(status)) {
-      return res.status(400).json({
-        error: `Cannot transition from '${task.status}' to '${status}'`,
-      });
-    }
-
-    // When rejecting (review → pending) or answering (question → pending), require feedback
-    if ((task.status === 'review' || task.status === 'question') && status === 'pending') {
-      if (!feedback && !req.body.feedback) {
-        return res.status(400).json({ error: 'feedback is required when rejecting or answering' });
-      }
-      task.feedback = feedback;
-      task.history = task.history || [];
-      task.history.push({ role: 'user', content: feedback });
-    }
-
-    task.status = status;
-  }
-
+  const { title, description } = req.body;
   if (title !== undefined) task.title = title;
   if (description !== undefined) task.description = description;
   task.updatedAt = new Date().toISOString();
@@ -407,20 +371,40 @@ app.delete('/api/tasks/:id', (req, res) => {
   // Kill running process/session
   const entry = runningProcesses.get(req.params.id);
   if (entry) {
-    if (entry.tmux) {
-      try { execSync(`tmux kill-session -t grindbot-${req.params.id}`, { stdio: 'ignore' }); } catch {}
-      // Clean up temp files
-      try { fs.unlinkSync(path.join(os.tmpdir(), `grindbot-${req.params.id}.log`)); } catch {}
-      try { fs.unlinkSync(path.join(os.tmpdir(), `grindbot-${req.params.id}.prompt`)); } catch {}
-    } else if (entry.process) {
-      entry.process.kill();
-    }
+    entry.kill();
     runningProcesses.delete(req.params.id);
   }
 
   tasks.splice(idx, 1);
   saveTasks(tasks);
   res.json({ ok: true });
+});
+
+// Stop a running task (kills session, marks completed)
+app.post('/api/tasks/:id/stop', (req, res) => {
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.id === req.params.id);
+  if (!task) return res.status(404).json({ error: 'task not found' });
+  if (task.status !== 'running') return res.status(400).json({ error: 'task is not running' });
+
+  const entry = runningProcesses.get(task.id);
+  let output = '(stopped by user)';
+  if (entry) {
+    if (entry instanceof TmuxSession) {
+      const log = stripAnsi(entry._readLog());
+      if (log) output = log;
+    }
+    entry.kill();
+  }
+
+  task.status = 'completed';
+  if (output.length > 50000) output = output.slice(-50000);
+  task.output = output;
+  task.pid = null;
+  task.updatedAt = new Date().toISOString();
+  saveTasks(tasks);
+
+  res.json(task);
 });
 
 // Open terminal for running task
@@ -432,22 +416,40 @@ app.post('/api/tasks/:id/terminal', (req, res) => {
   const tasks = loadTasks();
   const task = tasks.find(t => t.id === req.params.id);
   if (!task) return res.status(404).json({ error: 'task not found' });
-  if (task.status !== 'running') return res.status(400).json({ error: 'task is not running' });
 
-  const sessionName = `grindbot-${task.id}`;
-  if (!tmuxSessionExists(sessionName)) {
+  const entry = runningProcesses.get(task.id);
+  if (!(entry instanceof TmuxSession) || !entry.exists) {
     return res.status(400).json({ error: 'tmux session not found' });
   }
 
   try {
     execSync(
-      `osascript -e 'tell app "Terminal" to do script "tmux attach -t ${sessionName}"'`,
+      `osascript -e 'tell app "Terminal" to do script "tmux attach -t ${entry.sessionName}"'`,
       { stdio: 'ignore' }
     );
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: 'Failed to open terminal: ' + err.message });
   }
+});
+
+// Live output for running tasks (reads tmux log)
+app.get('/api/tasks/:id/output', (req, res) => {
+  const tasks = loadTasks();
+  const task = tasks.find(t => t.id === req.params.id);
+  if (!task) return res.status(404).json({ error: 'task not found' });
+
+  if (task.status === 'running') {
+    const session = runningProcesses.get(task.id);
+    if (session instanceof TmuxSession) {
+      let log = session._readLog();
+      log = stripAnsi(log);
+      if (log.length > 50000) log = log.slice(-50000);
+      return res.json({ output: log || '(waiting for output...)' });
+    }
+  }
+
+  res.json({ output: task.output || '(no output)' });
 });
 
 // Config
@@ -486,17 +488,11 @@ app.get('/api/polling/status', (req, res) => {
   res.json({ polling: pollingRunning });
 });
 
-// --- Start server ---
-
 // --- Graceful shutdown ---
 
 function shutdown() {
-  for (const [id, entry] of runningProcesses) {
-    if (entry.tmux) {
-      try { execSync(`tmux kill-session -t grindbot-${id}`, { stdio: 'ignore' }); } catch {}
-    } else if (entry.process) {
-      entry.process.kill();
-    }
+  for (const [, entry] of runningProcesses) {
+    entry.kill();
   }
   process.exit(0);
 }
